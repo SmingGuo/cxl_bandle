@@ -194,6 +194,22 @@ public:
         return true;
     }
 
+    uint64_t head() const {
+        return meta_->head.load(std::memory_order_acquire);
+    }
+
+    uint64_t tail() const {
+        return meta_->tail.load(std::memory_order_relaxed);
+    }
+
+    void commit_tail(uint64_t tail) {
+        meta_->tail.store(tail, std::memory_order_release);
+    }
+
+    bool read_at_abs(uint64_t abs, BandleMessage& out) const {
+        return read_slot(abs & MASK, abs + 1, out);
+    }
+
     bool is_full() const {
         const uint64_t h = meta_->head.load(std::memory_order_relaxed);
         const uint64_t t = meta_->tail.load(std::memory_order_acquire);
@@ -213,7 +229,6 @@ private:
             if (bytes > kMaxValueBytes) {
                 return false;
             }
-            std::memset(&out, 0, sizeof(out));
             out.slot_seq = d.slot_seq;
             out.type = d.type;
             out.body.seq = d.seq;

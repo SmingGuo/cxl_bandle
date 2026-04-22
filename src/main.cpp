@@ -141,7 +141,8 @@ static void usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <dax_path> <node_id> <port> --dataset <file> "
               << "[--preload-file <file>] [--preload-count <n>] [--recordcount <n>] "
               << "[--cluster-size <n>] [--run-id <id>] [--start-signal <file>] [--ready-file <file>] "
-              << "[--poll-idle-us <n>] [--noop-us <n>] [--batch-size <n>] [--stats-out <file>]\n";
+              << "[--poll-idle-us <n>] [--noop-us <n>] [--batch-size <n>] "
+              << "[--pipeline-workers <n>] [--stats-out <file>]\n";
 }
 
 int main(int argc, char** argv) {
@@ -166,6 +167,7 @@ int main(int argc, char** argv) {
     int poll_idle_us = 0;
     uint64_t noop_us = 100;
     uint32_t batch_size = 64;
+    size_t pipeline_workers = 1;
 
     for (int i = 4; i < argc; ++i) {
         std::string arg = argv[i];
@@ -191,6 +193,8 @@ int main(int argc, char** argv) {
             noop_us = std::stoull(argv[++i]);
         } else if (arg == "--batch-size" && i + 1 < argc) {
             batch_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--pipeline-workers" && i + 1 < argc) {
+            pipeline_workers = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (arg == "--stats-out" && i + 1 < argc) {
             stats_out = argv[++i];
         }
@@ -246,7 +250,7 @@ int main(int argc, char** argv) {
     }
 
     CXLMemoryPool pool(hwcc_ptr, non_hwcc_ptr);
-    Bandle bandle(&pool, shared_state, node_id, cluster_size, poll_idle_us, noop_us, batch_size);
+    Bandle bandle(&pool, shared_state, node_id, cluster_size, poll_idle_us, noop_us, batch_size, pipeline_workers);
     bandle.reserve_kv_entries(std::max<uint64_t>(recordcount, preload_count));
 
     if (preload_count > 0) {

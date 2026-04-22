@@ -52,7 +52,8 @@ public:
            uint64_t cluster_size,
            int poll_idle_us,
            uint64_t noop_interval_us,
-           uint32_t batch_size);
+           uint32_t batch_size,
+           size_t pipeline_workers);
     ~Bandle();
 
     void start(int recv_cpu = -1, int proposer_cpu = -1);
@@ -123,6 +124,9 @@ private:
 
     SpscRingView<kBandleRingCapacity> ring(uint64_t from, uint64_t to);
     void recv_loop(int cpu);
+    void recv_source_loop(uint64_t src, int cpu);
+    bool drain_source_ring(uint64_t src, std::vector<BandleMessage>& batch);
+    void handle_messages_batch(const BandleMessage* msgs, size_t count);
     void proposer_loop(int cpu);
     void handle_message(const BandleMessage& msg);
     void handle_proposal_locked(const BandleMessage& msg, std::vector<BandleMessage>& outbox);
@@ -149,11 +153,12 @@ private:
     int poll_idle_us_;
     uint64_t noop_interval_us_;
     uint32_t batch_size_;
+    size_t pipeline_workers_;
 
     KVStore kv_;
 
     std::atomic<bool> running_{false};
-    std::thread recv_thread_;
+    std::vector<std::thread> recv_threads_;
     std::thread proposer_thread_;
 
     mutable std::mutex mu_;

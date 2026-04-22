@@ -15,7 +15,7 @@
 ########################
 
 //Build for multi-VM shared-memory runs
-BANDLE_VM:BOOL=OFF
+BANDLE_VM:BOOL=ON
 
 //Path to a program.
 CMAKE_ADDR2LINE:FILEPATH=/usr/bin/addr2line

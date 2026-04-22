@@ -90,7 +90,8 @@ Bandle::Bandle(CXLMemoryPool* pool,
                uint64_t cluster_size,
                int poll_idle_us,
                uint64_t noop_interval_us,
-               uint32_t batch_size)
+               uint32_t batch_size,
+               size_t pipeline_workers)
     : pool_(pool),
       shared_(shared),
       non_hwcc_(reinterpret_cast<BandleNonHwccState*>(pool->get_non_hwcc())),
@@ -100,6 +101,7 @@ Bandle::Bandle(CXLMemoryPool* pool,
       poll_idle_us_(poll_idle_us),
       noop_interval_us_(noop_interval_us),
       batch_size_(batch_size == 0 ? 1 : batch_size),
+      pipeline_workers_(pipeline_workers == 0 ? 1 : pipeline_workers),
       next_seq_(node_id) {
     if (cluster_size_ != 3 || node_id_ < 1 || node_id_ > cluster_size_) {
         std::cerr << "This initial Bandle-CXL implementation supports exactly 3 nodes" << std::endl;
@@ -126,7 +128,23 @@ void Bandle::start(int recv_cpu, int proposer_cpu) {
         return;
     }
     last_noop_ns_ = now_ns();
-    recv_thread_ = std::thread(&Bandle::recv_loop, this, recv_cpu);
+    recv_threads_.clear();
+    if (pipeline_workers_ <= 1) {
+        recv_threads_.emplace_back(&Bandle::recv_loop, this, recv_cpu);
+    } else {
+        int idx = 0;
+        for (uint64_t src = 1; src <= cluster_size_; ++src) {
+            if (src == node_id_) {
+                continue;
+            }
+            int cpu = recv_cpu;
+            if (cpu >= 0) {
+                cpu += idx;
+            }
+            recv_threads_.emplace_back(&Bandle::recv_source_loop, this, src, cpu);
+            ++idx;
+        }
+    }
     proposer_thread_ = std::thread(&Bandle::proposer_loop, this, proposer_cpu);
 }
 
@@ -138,9 +156,12 @@ void Bandle::stop() {
     if (proposer_thread_.joinable()) {
         proposer_thread_.join();
     }
-    if (recv_thread_.joinable()) {
-        recv_thread_.join();
+    for (auto& t : recv_threads_) {
+        if (t.joinable()) {
+            t.join();
+        }
     }
+    recv_threads_.clear();
 }
 
 void Bandle::submit_borrowed(const BorrowedRequest& req) {
@@ -312,19 +333,77 @@ void Bandle::drain_outbox(const std::vector<BandleMessage>& outbox) {
     }
 }
 
+bool Bandle::drain_source_ring(uint64_t src, std::vector<BandleMessage>& batch) {
+    auto r = ring(src, node_id_);
+    const uint64_t t = r.tail();
+    const uint64_t h = r.head();
+    const uint64_t avail = h - t;
+    if (avail == 0) {
+        return false;
+    }
+
+    const size_t max_batch = std::max<size_t>(static_cast<size_t>(batch_size_), 64);
+    const size_t count = static_cast<size_t>(std::min<uint64_t>(avail, max_batch));
+    batch.resize(count);
+
+    size_t read_count = 0;
+    uint32_t spins = 0;
+    while (read_count < count && running_.load(std::memory_order_relaxed)) {
+        if (r.read_at_abs(t + read_count, batch[read_count])) {
+            ++read_count;
+            spins = 0;
+            continue;
+        }
+        spin_backoff(spins);
+    }
+
+    if (read_count == 0) {
+        batch.clear();
+        return false;
+    }
+    if (read_count != count) {
+        batch.resize(read_count);
+    }
+    r.commit_tail(t + read_count);
+    return true;
+}
+
+void Bandle::handle_messages_batch(const BandleMessage* msgs, size_t count) {
+    if (msgs == nullptr || count == 0) {
+        return;
+    }
+
+    std::vector<BandleMessage> outbox;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (size_t i = 0; i < count; ++i) {
+            const BandleMessage& msg = msgs[i];
+            if (msg.type == BandleMsgType::PROPOSAL) {
+                handle_proposal_locked(msg, outbox);
+            } else if (msg.type == BandleMsgType::P1) {
+                handle_p1_locked(msg, outbox);
+            } else if (msg.type == BandleMsgType::DECIDE) {
+                handle_decide_locked(msg);
+            }
+        }
+    }
+    drain_outbox(outbox);
+}
+
 void Bandle::recv_loop(int cpu) {
     pin_current_thread_to_cpu(cpu);
+    std::vector<BandleMessage> batch;
+    batch.reserve(std::max<size_t>(static_cast<size_t>(batch_size_), 64));
     while (running_.load(std::memory_order_relaxed)) {
         bool progressed = false;
         for (uint64_t src = 1; src <= cluster_size_; ++src) {
             if (src == node_id_) {
                 continue;
             }
-            auto r = ring(src, node_id_);
-            BandleMessage msg;
-            while (r.pop(msg)) {
+            while (drain_source_ring(src, batch)) {
                 progressed = true;
-                handle_message(msg);
+                handle_messages_batch(batch.data(), batch.size());
+                batch.clear();
             }
         }
         if (!progressed) {
@@ -333,6 +412,25 @@ void Bandle::recv_loop(int cpu) {
             } else {
                 cpu_relax();
             }
+        }
+    }
+}
+
+void Bandle::recv_source_loop(uint64_t src, int cpu) {
+    pin_current_thread_to_cpu(cpu);
+    std::vector<BandleMessage> batch;
+    batch.reserve(std::max<size_t>(static_cast<size_t>(batch_size_), 64));
+    while (running_.load(std::memory_order_relaxed)) {
+        if (drain_source_ring(src, batch)) {
+            handle_messages_batch(batch.data(), batch.size());
+            batch.clear();
+            continue;
+        }
+
+        if (poll_idle_us_ > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(poll_idle_us_));
+        } else {
+            cpu_relax();
         }
     }
 }
@@ -436,11 +534,16 @@ void Bandle::handle_proposal_locked(const BandleMessage& msg, std::vector<Bandle
         e.proposer = b.proposer;
         e.client_req_id = b.client_req_id;
         e.start_tsc = b.start_tsc;
-        e.key.assign(b.data, b.key_len);
-        if (b.value_len != 0) {
-            e.value.assign(b.data + b.key_len, b.value_len);
-        } else {
+        if (b.op == 'G' || b.op == 'N') {
+            e.key.clear();
             e.value.clear();
+        } else {
+            e.key.assign(b.data, b.key_len);
+            if (b.value_len != 0) {
+                e.value.assign(b.data + b.key_len, b.value_len);
+            } else {
+                e.value.clear();
+            }
         }
     }
     // Basic 3-node/no-crash fast path: once a proposal is durably delivered
