@@ -76,6 +76,24 @@ static inline bool is_write_op(char op) {
     return op == 'P' || op == 'U' || op == 'D';
 }
 
+static inline size_t recv_batch_capacity(uint32_t submit_batch_size) {
+    constexpr size_t kMinRecvBatch = 128;
+    constexpr size_t kMaxRecvBatch = 512;
+    return std::min(kMaxRecvBatch, std::max(kMinRecvBatch, static_cast<size_t>(submit_batch_size)));
+}
+
+static inline uint64_t max_inflight_seq_window(uint32_t submit_batch_size, uint64_t cluster_size) {
+    constexpr uint64_t kTargetWindow = 128;
+    const uint64_t min_for_batches =
+        cluster_size * std::max<uint64_t>(static_cast<uint64_t>(submit_batch_size), 1) * 2;
+    return std::max(kTargetWindow, min_for_batches);
+}
+
+static inline size_t admission_batch_capacity(size_t submit_count) {
+    constexpr size_t kAdmissionBatch = 16;
+    return std::max<size_t>(1, std::min(kAdmissionBatch, submit_count));
+}
+
 }
 
 void Bandle::AtomicHistogram::record(uint64_t value) {
@@ -190,16 +208,21 @@ void Bandle::submit_borrowed_batch(const BorrowedRequest* reqs, size_t count) {
         proposal.body.round = 1;
         proposal.body.sender = node_id_;
         proposal.body.proposer = node_id_;
-        proposal.body.start_tsc = rdtsc_ordered();
+        proposal.body.start_tsc = 0;
         proposal.body.op = in.op;
-        proposal.body.key_len = static_cast<uint32_t>(std::min<uint32_t>(in.key_len, kMaxValueBytes));
-        proposal.body.value_len = static_cast<uint32_t>(
-            std::min<uint32_t>(in.value_len, static_cast<uint32_t>(kMaxValueBytes - proposal.body.key_len)));
-        if (proposal.body.key_len != 0 && in.key_ptr != nullptr) {
-            std::memcpy(proposal.body.data, in.key_ptr, proposal.body.key_len);
-        }
-        if (proposal.body.value_len != 0 && in.value_ptr != nullptr) {
-            std::memcpy(proposal.body.data + proposal.body.key_len, in.value_ptr, proposal.body.value_len);
+        if (in.op == 'G') {
+            proposal.body.key_len = 0;
+            proposal.body.value_len = 0;
+        } else {
+            proposal.body.key_len = static_cast<uint32_t>(std::min<uint32_t>(in.key_len, kMaxValueBytes));
+            proposal.body.value_len = static_cast<uint32_t>(
+                std::min<uint32_t>(in.value_len, static_cast<uint32_t>(kMaxValueBytes - proposal.body.key_len)));
+            if (proposal.body.key_len != 0 && in.key_ptr != nullptr) {
+                std::memcpy(proposal.body.data, in.key_ptr, proposal.body.key_len);
+            }
+            if (proposal.body.value_len != 0 && in.value_ptr != nullptr) {
+                std::memcpy(proposal.body.data + proposal.body.key_len, in.value_ptr, proposal.body.value_len);
+            }
         }
     }
 
@@ -207,48 +230,58 @@ void Bandle::submit_borrowed_batch(const BorrowedRequest* reqs, size_t count) {
         return;
     }
 
-    {
-        uint32_t spins = 0;
-        while (true) {
-            bool assigned = false;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                const uint64_t last_seq = next_seq_ + (static_cast<uint64_t>(proposals.size() - 1) * cluster_size_);
-                if (last_seq < execute_next_ + (kCompletionSlots / 2)) {
-                    for (BandleMessage& proposal : proposals) {
-                        proposal.body.seq = next_seq_;
-                    const uint64_t local_id = next_client_req_id_++;
-                    proposal.body.client_req_id = (node_id_ << 56) | local_id;
-                        highest_proposed_seq_ = std::max(highest_proposed_seq_, next_seq_);
-                        next_seq_ += cluster_size_;
+    const size_t admit_cap = admission_batch_capacity(proposals.size());
+    for (size_t base = 0; base < proposals.size(); base += admit_cap) {
+        const size_t chunk = std::min(admit_cap, proposals.size() - base);
+        BandleMessage* chunk_msgs = proposals.data() + base;
 
-                    Pending p;
-                    p.id = proposal.body.client_req_id;
-                    p.op = proposal.body.op;
-                    p.start_tsc = proposal.body.start_tsc;
-                    pending_[local_id & (kCompletionSlots - 1)] = p;
-                    ++pending_count_;
+        {
+            uint32_t spins = 0;
+            const uint64_t window = max_inflight_seq_window(static_cast<uint32_t>(chunk), cluster_size_);
+            while (true) {
+                bool assigned = false;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    const uint64_t last_seq = next_seq_ + (static_cast<uint64_t>(chunk - 1) * cluster_size_);
+                    if (last_seq < execute_next_ + window) {
+                        for (size_t i = 0; i < chunk; ++i) {
+                            BandleMessage& proposal = chunk_msgs[i];
+                            proposal.body.seq = next_seq_;
+                            proposal.body.start_tsc = rdtsc_ordered();
+                            const uint64_t local_id = next_client_req_id_++;
+                            proposal.body.client_req_id = (node_id_ << 56) | local_id;
+                            highest_proposed_seq_ = std::max(highest_proposed_seq_, next_seq_);
+                            next_seq_ += cluster_size_;
+
+                            Pending p;
+                            p.id = proposal.body.client_req_id;
+                            p.op = proposal.body.op;
+                            p.start_tsc = proposal.body.start_tsc;
+                            pending_[local_id & (kCompletionSlots - 1)] = p;
+                            ++pending_count_;
+                        }
+                        assigned = true;
                     }
-                    assigned = true;
                 }
+                if (assigned) {
+                    break;
+                }
+                spin_backoff(spins);
             }
-            if (assigned) {
-                break;
+        }
+
+        broadcast_batch(chunk_msgs, chunk);
+
+        std::vector<BandleMessage> outbox;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (size_t i = 0; i < chunk; ++i) {
+                handle_proposal_locked(chunk_msgs[i], outbox, false);
             }
-            spin_backoff(spins);
+            advance_execute_locked();
         }
+        drain_outbox(outbox);
     }
-
-    broadcast_batch(proposals.data(), proposals.size());
-
-    std::vector<BandleMessage> outbox;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (const BandleMessage& proposal : proposals) {
-            handle_proposal_locked(proposal, outbox);
-        }
-    }
-    drain_outbox(outbox);
 }
 
 void Bandle::mark_input_done() {
@@ -333,7 +366,8 @@ void Bandle::drain_outbox(const std::vector<BandleMessage>& outbox) {
     }
 }
 
-bool Bandle::drain_source_ring(uint64_t src, std::vector<BandleMessage>& batch) {
+bool Bandle::drain_source_ring(uint64_t src, std::vector<BandleMessage>& batch, size_t& count_out) {
+    count_out = 0;
     auto r = ring(src, node_id_);
     const uint64_t t = r.tail();
     const uint64_t h = r.head();
@@ -342,15 +376,22 @@ bool Bandle::drain_source_ring(uint64_t src, std::vector<BandleMessage>& batch) 
         return false;
     }
 
-    const size_t max_batch = std::max<size_t>(static_cast<size_t>(batch_size_), 64);
+    const size_t max_batch = recv_batch_capacity(batch_size_);
     const size_t count = static_cast<size_t>(std::min<uint64_t>(avail, max_batch));
-    batch.resize(count);
+    if (batch.size() < count) {
+        batch.resize(count);
+    }
 
-    size_t read_count = 0;
+    size_t read_count = r.read_batch_at_abs(t, batch.data(), count);
     uint32_t spins = 0;
+    while (read_count == 0 && running_.load(std::memory_order_relaxed)) {
+        spin_backoff(spins);
+        read_count = r.read_batch_at_abs(t, batch.data(), count);
+    }
     while (read_count < count && running_.load(std::memory_order_relaxed)) {
-        if (r.read_at_abs(t + read_count, batch[read_count])) {
-            ++read_count;
+        const size_t n = r.read_batch_at_abs(t + read_count, batch.data() + read_count, count - read_count);
+        if (n != 0) {
+            read_count += n;
             spins = 0;
             continue;
         }
@@ -358,13 +399,10 @@ bool Bandle::drain_source_ring(uint64_t src, std::vector<BandleMessage>& batch) 
     }
 
     if (read_count == 0) {
-        batch.clear();
         return false;
     }
-    if (read_count != count) {
-        batch.resize(read_count);
-    }
     r.commit_tail(t + read_count);
+    count_out = read_count;
     return true;
 }
 
@@ -374,36 +412,48 @@ void Bandle::handle_messages_batch(const BandleMessage* msgs, size_t count) {
     }
 
     std::vector<BandleMessage> outbox;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (size_t i = 0; i < count; ++i) {
-            const BandleMessage& msg = msgs[i];
-            if (msg.type == BandleMsgType::PROPOSAL) {
-                handle_proposal_locked(msg, outbox);
-            } else if (msg.type == BandleMsgType::P1) {
-                handle_p1_locked(msg, outbox);
-            } else if (msg.type == BandleMsgType::DECIDE) {
-                handle_decide_locked(msg);
+    constexpr size_t kHandleChunk = 64;
+    for (size_t base = 0; base < count; base += kHandleChunk) {
+        const size_t end = std::min(count, base + kHandleChunk);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            bool need_advance = false;
+            for (size_t i = base; i < end; ++i) {
+                const BandleMessage& msg = msgs[i];
+                if (msg.type == BandleMsgType::PROPOSAL) {
+                    handle_proposal_locked(msg, outbox, false);
+                    need_advance = true;
+                } else if (msg.type == BandleMsgType::P1) {
+                    handle_p1_locked(msg, outbox);
+                } else if (msg.type == BandleMsgType::DECIDE) {
+                    handle_decide_locked(msg);
+                }
+            }
+            if (need_advance) {
+                advance_execute_locked();
             }
         }
+        if (!outbox.empty()) {
+            drain_outbox(outbox);
+            outbox.clear();
+        }
     }
-    drain_outbox(outbox);
 }
 
 void Bandle::recv_loop(int cpu) {
     pin_current_thread_to_cpu(cpu);
     std::vector<BandleMessage> batch;
-    batch.reserve(std::max<size_t>(static_cast<size_t>(batch_size_), 64));
+    batch.resize(recv_batch_capacity(batch_size_));
     while (running_.load(std::memory_order_relaxed)) {
         bool progressed = false;
         for (uint64_t src = 1; src <= cluster_size_; ++src) {
             if (src == node_id_) {
                 continue;
             }
-            while (drain_source_ring(src, batch)) {
+            size_t count = 0;
+            while (drain_source_ring(src, batch, count)) {
                 progressed = true;
-                handle_messages_batch(batch.data(), batch.size());
-                batch.clear();
+                handle_messages_batch(batch.data(), count);
             }
         }
         if (!progressed) {
@@ -419,11 +469,11 @@ void Bandle::recv_loop(int cpu) {
 void Bandle::recv_source_loop(uint64_t src, int cpu) {
     pin_current_thread_to_cpu(cpu);
     std::vector<BandleMessage> batch;
-    batch.reserve(std::max<size_t>(static_cast<size_t>(batch_size_), 64));
+    batch.resize(recv_batch_capacity(batch_size_));
     while (running_.load(std::memory_order_relaxed)) {
-        if (drain_source_ring(src, batch)) {
-            handle_messages_batch(batch.data(), batch.size());
-            batch.clear();
+        size_t count = 0;
+        if (drain_source_ring(src, batch, count)) {
+            handle_messages_batch(batch.data(), count);
             continue;
         }
 
@@ -510,7 +560,7 @@ void Bandle::handle_message(const BandleMessage& msg) {
     drain_outbox(outbox);
 }
 
-void Bandle::handle_proposal_locked(const BandleMessage& msg, std::vector<BandleMessage>& outbox) {
+void Bandle::handle_proposal_locked(const BandleMessage& msg, std::vector<BandleMessage>& outbox, bool advance) {
     (void)outbox;
     const auto& b = msg.body;
     LogEntry& e = log_[b.seq & (kCompletionSlots - 1)];
@@ -553,7 +603,9 @@ void Bandle::handle_proposal_locked(const BandleMessage& msg, std::vector<Bandle
     // requested non-crash read/write path.
     e.decided = true;
     e.decision = 1;
-    advance_execute_locked();
+    if (advance) {
+        advance_execute_locked();
+    }
 }
 
 void Bandle::input_one_locked(uint64_t seq, std::vector<BandleMessage>& outbox) {

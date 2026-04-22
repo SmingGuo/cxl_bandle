@@ -126,7 +126,7 @@ public:
             return false;
         }
         if (bytes != 0) {
-            pool_->nt_memcpy(payloads_[idx], msg.body.data, static_cast<size_t>(bytes));
+            nt_store_payload_padded(idx, msg.body.data, static_cast<size_t>(bytes));
             pool_->sfence();
         }
         descs_[idx] = d;
@@ -168,7 +168,7 @@ public:
                 return false;
             }
             if (bytes != 0) {
-                pool_->nt_memcpy(payloads_[idx], msg.body.data, static_cast<size_t>(bytes));
+                nt_store_payload_padded(idx, msg.body.data, static_cast<size_t>(bytes));
                 wrote_payload = true;
             }
             descs_[idx] = d;
@@ -210,6 +210,54 @@ public:
         return read_slot(abs & MASK, abs + 1, out);
     }
 
+    size_t read_batch_at_abs(uint64_t abs, BandleMessage* out, size_t max_count) const {
+        if (out == nullptr || max_count == 0) {
+            return 0;
+        }
+
+        size_t count = 0;
+        for (; count < max_count; ++count) {
+            const uint64_t cur_abs = abs + count;
+            const uint64_t idx = cur_abs & MASK;
+            if (count + 8 < max_count) {
+                const uint64_t pf_idx = (cur_abs + 8) & MASK;
+                _mm_prefetch(reinterpret_cast<const char*>(&descs_[pf_idx]), _MM_HINT_T0);
+            }
+            if (!read_slot_descriptor(idx, cur_abs + 1, out[count])) {
+                break;
+            }
+            const uint64_t bytes = static_cast<uint64_t>(out[count].body.key_len) +
+                                   static_cast<uint64_t>(out[count].body.value_len);
+            if (bytes != 0) {
+                _mm_prefetch(payloads_[idx], _MM_HINT_T0);
+            }
+        }
+
+        if (count == 0) {
+            return 0;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            const uint64_t idx = (abs + i) & MASK;
+            const uint64_t bytes = static_cast<uint64_t>(out[i].body.key_len) +
+                                   static_cast<uint64_t>(out[i].body.value_len);
+            if (bytes == 0) {
+                continue;
+            }
+            if (i + 8 < count) {
+                const uint64_t pf_idx = (abs + i + 8) & MASK;
+                const BandleMessage& pf = out[i + 8];
+                const uint64_t pf_bytes = static_cast<uint64_t>(pf.body.key_len) +
+                                          static_cast<uint64_t>(pf.body.value_len);
+                if (pf_bytes != 0) {
+                    _mm_prefetch(payloads_[pf_idx], _MM_HINT_T0);
+                }
+            }
+            std::memcpy(out[i].body.data, payloads_[idx], static_cast<size_t>(bytes));
+        }
+        return count;
+    }
+
     bool is_full() const {
         const uint64_t h = meta_->head.load(std::memory_order_relaxed);
         const uint64_t t = meta_->tail.load(std::memory_order_acquire);
@@ -217,7 +265,33 @@ public:
     }
 
 private:
-    bool read_slot(uint64_t idx, uint64_t expected, BandleMessage& out) const {
+    void nt_store_payload_padded(uint64_t idx, const void* src, size_t len) const {
+        if (len == 0) {
+            return;
+        }
+
+        auto* dst = payloads_[idx];
+        const auto* data = static_cast<const char*>(src);
+        const size_t full = (len / 64) * 64;
+        for (size_t off = 0; off < full; off += 64) {
+            pool_->nt_store_16(dst + off + 0, data + off + 0);
+            pool_->nt_store_16(dst + off + 16, data + off + 16);
+            pool_->nt_store_16(dst + off + 32, data + off + 32);
+            pool_->nt_store_16(dst + off + 48, data + off + 48);
+        }
+
+        const size_t tail = len - full;
+        if (tail != 0) {
+            alignas(64) char tmp[64] = {};
+            std::memcpy(tmp, data + full, tail);
+            pool_->nt_store_16(dst + full + 0, tmp + 0);
+            pool_->nt_store_16(dst + full + 16, tmp + 16);
+            pool_->nt_store_16(dst + full + 32, tmp + 32);
+            pool_->nt_store_16(dst + full + 48, tmp + 48);
+        }
+    }
+
+    bool read_slot_descriptor(uint64_t idx, uint64_t expected, BandleMessage& out) const {
         constexpr int kRetries = 64;
         for (int i = 0; i < kRetries; ++i) {
             BandleDescriptor d = descs_[idx];
@@ -242,14 +316,21 @@ private:
             out.body.op = d.op;
             out.body.key_len = d.key_len;
             out.body.value_len = d.value_len;
-            if (bytes != 0) {
-                pool_->clflush(payloads_[idx], static_cast<size_t>(bytes));
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                std::memcpy(out.body.data, payloads_[idx], static_cast<size_t>(bytes));
-            }
             return true;
         }
         return false;
+    }
+
+    bool read_slot(uint64_t idx, uint64_t expected, BandleMessage& out) const {
+        if (!read_slot_descriptor(idx, expected, out)) {
+            return false;
+        }
+        const uint64_t bytes = static_cast<uint64_t>(out.body.key_len) +
+                               static_cast<uint64_t>(out.body.value_len);
+        if (bytes != 0) {
+            std::memcpy(out.body.data, payloads_[idx], static_cast<size_t>(bytes));
+        }
+        return true;
     }
 
     CXLMemoryPool* pool_;

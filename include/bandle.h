@@ -125,11 +125,11 @@ private:
     SpscRingView<kBandleRingCapacity> ring(uint64_t from, uint64_t to);
     void recv_loop(int cpu);
     void recv_source_loop(uint64_t src, int cpu);
-    bool drain_source_ring(uint64_t src, std::vector<BandleMessage>& batch);
+    bool drain_source_ring(uint64_t src, std::vector<BandleMessage>& batch, size_t& count);
     void handle_messages_batch(const BandleMessage* msgs, size_t count);
     void proposer_loop(int cpu);
     void handle_message(const BandleMessage& msg);
-    void handle_proposal_locked(const BandleMessage& msg, std::vector<BandleMessage>& outbox);
+    void handle_proposal_locked(const BandleMessage& msg, std::vector<BandleMessage>& outbox, bool advance = true);
     void handle_p1_locked(const BandleMessage& msg, std::vector<BandleMessage>& outbox);
     void handle_decide_locked(const BandleMessage& msg);
     void input_one_locked(uint64_t seq, std::vector<BandleMessage>& outbox);
