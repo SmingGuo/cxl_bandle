@@ -1,6 +1,7 @@
 #include "bandle.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -90,7 +91,7 @@ static inline uint64_t max_inflight_seq_window(uint32_t submit_batch_size, uint6
 }
 
 static inline size_t admission_batch_capacity(size_t submit_count) {
-    constexpr size_t kAdmissionBatch = 16;
+    constexpr size_t kAdmissionBatch = 32;
     return std::max<size_t>(1, std::min(kAdmissionBatch, submit_count));
 }
 
@@ -191,8 +192,18 @@ void Bandle::submit_borrowed_batch(const BorrowedRequest* reqs, size_t count) {
         return;
     }
 
-    std::vector<BandleMessage> proposals;
-    proposals.reserve(count);
+    constexpr size_t kFastProposalCapacity = 256;
+    thread_local std::array<BandleMessage, kFastProposalCapacity> fast_proposals;
+    thread_local std::vector<BandleMessage> overflow_proposals;
+
+    BandleMessage* proposals = fast_proposals.data();
+    if (count > kFastProposalCapacity) {
+        if (overflow_proposals.size() < count) {
+            overflow_proposals.resize(count);
+        }
+        proposals = overflow_proposals.data();
+    }
+    size_t proposal_count = 0;
 
     for (size_t i = 0; i < count; ++i) {
         const BorrowedRequest& in = reqs[i];
@@ -203,12 +214,17 @@ void Bandle::submit_borrowed_batch(const BorrowedRequest* reqs, size_t count) {
             continue;
         }
 
-        BandleMessage& proposal = proposals.emplace_back();
+        BandleMessage& proposal = proposals[proposal_count++];
+        proposal.slot_seq = 0;
         proposal.type = BandleMsgType::PROPOSAL;
         proposal.body.round = 1;
         proposal.body.sender = node_id_;
         proposal.body.proposer = node_id_;
+        proposal.body.seq = 0;
+        proposal.body.client_req_id = 0;
         proposal.body.start_tsc = 0;
+        proposal.body.value = 1;
+        proposal.body.promise = 0;
         proposal.body.op = in.op;
         if (in.op == 'G') {
             proposal.body.key_len = 0;
@@ -226,14 +242,14 @@ void Bandle::submit_borrowed_batch(const BorrowedRequest* reqs, size_t count) {
         }
     }
 
-    if (proposals.empty()) {
+    if (proposal_count == 0) {
         return;
     }
 
-    const size_t admit_cap = admission_batch_capacity(proposals.size());
-    for (size_t base = 0; base < proposals.size(); base += admit_cap) {
-        const size_t chunk = std::min(admit_cap, proposals.size() - base);
-        BandleMessage* chunk_msgs = proposals.data() + base;
+    const size_t admit_cap = admission_batch_capacity(proposal_count);
+    for (size_t base = 0; base < proposal_count; base += admit_cap) {
+        const size_t chunk = std::min(admit_cap, proposal_count - base);
+        BandleMessage* chunk_msgs = proposals + base;
 
         {
             uint32_t spins = 0;
@@ -347,16 +363,55 @@ void Bandle::broadcast_batch(const BandleMessage* msgs, size_t count) {
     if (msgs == nullptr || count == 0) {
         return;
     }
+
     std::lock_guard<std::mutex> lk(send_mu_);
-    for (uint64_t peer = 1; peer <= cluster_size_; ++peer) {
-        if (peer == node_id_) {
+    std::array<uint64_t, kMaxBandleNodes + 1> heads{};
+    uint32_t spins = 0;
+    while (running_.load(std::memory_order_relaxed)) {
+        bool ready = true;
+        for (uint64_t peer = 1; peer <= cluster_size_; ++peer) {
+            if (peer == node_id_) {
+                continue;
+            }
+            auto r = ring(node_id_, peer);
+            if (!r.can_push_batch(count, heads[peer])) {
+                ready = false;
+                break;
+            }
+        }
+        if (!ready) {
+            spin_backoff(spins);
             continue;
         }
-        uint32_t spins = 0;
-        auto r = ring(node_id_, peer);
-        while (running_.load(std::memory_order_relaxed) && !r.push_batch(msgs, count)) {
-            spin_backoff(spins);
+
+        bool wrote_payload = false;
+        bool write_ok = true;
+        for (uint64_t peer = 1; peer <= cluster_size_; ++peer) {
+            if (peer == node_id_) {
+                continue;
+            }
+            bool ring_wrote_payload = false;
+            auto r = ring(node_id_, peer);
+            if (!r.write_batch_at(heads[peer], msgs, count, ring_wrote_payload)) {
+                write_ok = false;
+                break;
+            }
+            wrote_payload = wrote_payload || ring_wrote_payload;
         }
+        if (!write_ok) {
+            return;
+        }
+        if (wrote_payload) {
+            pool_->sfence();
+        }
+        for (uint64_t peer = 1; peer <= cluster_size_; ++peer) {
+            if (peer == node_id_) {
+                continue;
+            }
+            auto r = ring(node_id_, peer);
+            r.publish_head(heads[peer] + count);
+        }
+        return;
     }
 }
 

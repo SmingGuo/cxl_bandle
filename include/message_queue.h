@@ -138,18 +138,39 @@ public:
         if (count == 0) {
             return true;
         }
+        uint64_t head = 0;
+        if (!can_push_batch(count, head)) {
+            return false;
+        }
+
+        bool wrote_payload = false;
+        if (!write_batch_at(head, msgs, count, wrote_payload)) {
+            return false;
+        }
+        if (wrote_payload) {
+            pool_->sfence();
+        }
+        publish_head(head + count);
+        return true;
+    }
+
+    bool can_push_batch(size_t count, uint64_t& head_out) const {
         uint64_t h = meta_->head.load(std::memory_order_relaxed);
         uint64_t t = meta_->tail.load(std::memory_order_acquire);
         if ((h - t) + count > Capacity) {
             return false;
         }
+        head_out = h;
+        return true;
+    }
 
-        bool wrote_payload = false;
+    bool write_batch_at(uint64_t head, const BandleMessage* msgs, size_t count, bool& wrote_payload) {
+        wrote_payload = false;
         for (size_t i = 0; i < count; ++i) {
-            const uint64_t idx = (h + i) & MASK;
+            const uint64_t idx = (head + i) & MASK;
             const BandleMessage& msg = msgs[i];
             BandleDescriptor d{};
-            d.slot_seq = h + i + 1;
+            d.slot_seq = head + i + 1;
             d.type = msg.type;
             d.seq = msg.body.seq;
             d.round = msg.body.round;
@@ -173,11 +194,11 @@ public:
             }
             descs_[idx] = d;
         }
-        if (wrote_payload) {
-            pool_->sfence();
-        }
-        meta_->head.store(h + count, std::memory_order_release);
         return true;
+    }
+
+    void publish_head(uint64_t head) {
+        meta_->head.store(head, std::memory_order_release);
     }
 
     bool pop(BandleMessage& out) {
