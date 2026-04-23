@@ -12,7 +12,7 @@
 constexpr size_t kMaxBandleNodes = 3;
 constexpr size_t kBandleRingCapacity = 32768;
 constexpr size_t kMaxValueBytes = 1088;
-constexpr size_t kCompletionSlots = 1u << 20;
+constexpr size_t kCompletionSlots = 1u << 16;
 
 enum class BandleMsgType : uint8_t {
     PROPOSAL = 1,

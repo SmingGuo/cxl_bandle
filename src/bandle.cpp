@@ -84,10 +84,10 @@ static inline size_t recv_batch_capacity(uint32_t submit_batch_size) {
 }
 
 static inline uint64_t max_inflight_seq_window(uint32_t submit_batch_size, uint64_t cluster_size) {
-    constexpr uint64_t kTargetWindow = 128;
-    const uint64_t min_for_batches =
-        cluster_size * std::max<uint64_t>(static_cast<uint64_t>(submit_batch_size), 1) * 2;
-    return std::max(kTargetWindow, min_for_batches);
+    constexpr uint64_t kTargetWindow = 160;
+    const uint64_t min_for_batch =
+        cluster_size * std::max<uint64_t>(static_cast<uint64_t>(submit_batch_size), 1) + cluster_size;
+    return std::max(kTargetWindow, min_for_batch);
 }
 
 static inline size_t admission_batch_capacity(size_t submit_count) {
@@ -128,6 +128,10 @@ Bandle::Bandle(CXLMemoryPool* pool,
     }
     log_.resize(kCompletionSlots);
     pending_.resize(kCompletionSlots);
+    for (auto& entry : log_) {
+        entry.key.reserve(64);
+        entry.value.reserve(kMaxValueBytes);
+    }
 }
 
 Bandle::~Bandle() {
@@ -776,67 +780,88 @@ void Bandle::handle_decide_locked(const BandleMessage& msg) {
 }
 
 void Bandle::advance_execute_locked() {
+    constexpr size_t kExecuteBatchMax = 256;
+    std::array<KVStore::ApplyOp, kExecuteBatchMax> apply_ops;
+    bool notify_waiter = false;
+
     while (true) {
-        LogEntry& e = log_[execute_next_ & (kCompletionSlots - 1)];
-        if (e.seq != execute_next_) {
-            return;
-        }
-        if (!e.decided) {
-            return;
-        }
-        if (e.decision == 1 && !e.proposal_known) {
-            return;
-        }
+        const uint64_t base_seq = execute_next_;
+        size_t exec_count = 0;
+        size_t apply_count = 0;
 
-        if (e.decision == 1) {
-            if (e.op == 'P') {
-                kv_.put(e.key, e.value);
-            } else if (e.op == 'U') {
-                kv_.update(std::string_view(e.key), std::move(e.value));
-            } else if (e.op == 'D') {
-                kv_.erase(e.key);
-            } else if (e.op == 'G') {
-                // Reads are ordered through Bandle. The replay workload does
-                // not consume returned values, so avoid an extra locked hash
-                // lookup on every replica.
+        for (; exec_count < kExecuteBatchMax; ++exec_count) {
+            const uint64_t seq = base_seq + exec_count;
+            LogEntry& e = log_[seq & (kCompletionSlots - 1)];
+            if (e.seq != seq || !e.decided) {
+                break;
             }
+            if (e.decision == 1 && !e.proposal_known) {
+                break;
+            }
+            if (e.decision == 1 && is_write_op(e.op)) {
+                KVStore::ApplyOp& op = apply_ops[apply_count++];
+                op.op = e.op;
+                op.shard = shard_for(e.key);
+                op.key = std::string_view(e.key);
+                op.value = (e.op == 'D') ? std::string_view() : std::string_view(e.value);
+            }
+        }
 
-            if (e.proposer == node_id_ && e.client_req_id != 0) {
-                const uint64_t local_id = e.client_req_id & ((1ull << 56) - 1);
-                Pending& p = pending_[local_id & (kCompletionSlots - 1)];
-                if (p.id == e.client_req_id && !p.done) {
-                    const uint64_t end = rdtsc_ordered();
-                    const uint64_t start = p.start_tsc;
-                    if (p.op == 'G') {
-                        read_ops_.fetch_add(1, std::memory_order_relaxed);
-                        read_latency_.record(end >= start ? end - start : 0);
-                    } else {
-                        write_ops_.fetch_add(1, std::memory_order_relaxed);
-                        write_latency_.record(end >= start ? end - start : 0);
+        if (exec_count == 0) {
+            if (notify_waiter) {
+                pending_cv_.notify_all();
+            }
+            return;
+        }
+
+        if (apply_count != 0) {
+            kv_.apply_ops_in_order(apply_ops.data(), apply_count);
+        }
+
+        for (size_t i = 0; i < exec_count; ++i) {
+            LogEntry& e = log_[(base_seq + i) & (kCompletionSlots - 1)];
+
+            if (e.decision == 1) {
+                if (e.proposer == node_id_ && e.client_req_id != 0) {
+                    const uint64_t local_id = e.client_req_id & ((1ull << 56) - 1);
+                    Pending& p = pending_[local_id & (kCompletionSlots - 1)];
+                    if (p.id == e.client_req_id && !p.done) {
+                        const uint64_t end = rdtsc_ordered();
+                        const uint64_t start = p.start_tsc;
+                        if (p.op == 'G') {
+                            read_ops_.fetch_add(1, std::memory_order_relaxed);
+                            read_latency_.record(end >= start ? end - start : 0);
+                        } else {
+                            write_ops_.fetch_add(1, std::memory_order_relaxed);
+                            write_latency_.record(end >= start ? end - start : 0);
+                        }
+                        p.done = true;
+                        ok_ops_.fetch_add(1, std::memory_order_relaxed);
+                        total_ops_.fetch_add(1, std::memory_order_relaxed);
+                        if (pending_count_ > 0) {
+                            --pending_count_;
+                            if (pending_count_ == 0) {
+                                notify_waiter = true;
+                            }
+                        }
                     }
-                    p.done = true;
-                    ok_ops_.fetch_add(1, std::memory_order_relaxed);
-                    total_ops_.fetch_add(1, std::memory_order_relaxed);
-                    if (pending_count_ > 0) {
-                        --pending_count_;
-                    }
-                    pending_cv_.notify_all();
                 }
             }
+
+            e.proposal_known = false;
+            e.p1_sent = false;
+            e.decided = false;
+            e.decision = 0;
+            e.p1_value1_promise_mask = 0;
+            e.op = 'N';
+            e.key.clear();
+            e.value.clear();
+            e.proposer = 0;
+            e.client_req_id = 0;
+            e.start_tsc = 0;
+            e.seq = 0;
         }
 
-        e.proposal_known = false;
-        e.p1_sent = false;
-        e.decided = false;
-        e.decision = 0;
-        e.p1_value1_promise_mask = 0;
-        e.op = 'N';
-        e.key.clear();
-        e.value.clear();
-        e.proposer = 0;
-        e.client_req_id = 0;
-        e.start_tsc = 0;
-        e.seq = 0;
-        ++execute_next_;
+        execute_next_ += exec_count;
     }
 }
