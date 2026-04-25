@@ -53,7 +53,9 @@ public:
            int poll_idle_us,
            uint64_t noop_interval_us,
            uint32_t batch_size,
-           size_t pipeline_workers);
+           size_t pipeline_workers,
+           uint64_t admission_window,
+           uint32_t admission_batch);
     ~Bandle();
 
     void start(int recv_cpu = -1, int proposer_cpu = -1);
@@ -154,6 +156,8 @@ private:
     uint64_t noop_interval_us_;
     uint32_t batch_size_;
     size_t pipeline_workers_;
+    uint64_t admission_window_;
+    uint32_t admission_batch_;
 
     KVStore kv_;
 

@@ -13,6 +13,8 @@ POLL_IDLE_US=${POLL_IDLE_US:-0}
 NOOP_US=${NOOP_US:-500}
 BATCH_SIZE=${BATCH_SIZE:-64}
 PIPELINE_WORKERS=${PIPELINE_WORKERS:-1}
+BANDLE_ADMISSION_WINDOW=${BANDLE_ADMISSION_WINDOW:-192}
+BANDLE_ADMISSION_BATCH=${BANDLE_ADMISSION_BATCH:-32}
 PERF_STATS=${PERF_STATS:-0}
 RUN_ID=${RUN_ID:-0}
 START_SIGNAL=${START_SIGNAL:-}
@@ -37,10 +39,6 @@ fi
 if [[ ! -e "${DAX_DEV}" ]]; then
     echo "CXL device ${DAX_DEV} not found"
     exit 1
-fi
-
-if [[ -n "${PID_FILE}" ]]; then
-    echo "$$" > "${PID_FILE}"
 fi
 
 BUILD_DIR="$(cd "$(dirname "$0")/../build" && pwd)"
@@ -69,6 +67,14 @@ if [[ "${CPU_PER_NODE}" -gt 0 ]]; then
     fi
 fi
 
+child_pid=""
+terminate_child() {
+    if [[ -n "${child_pid}" ]] && kill -0 "${child_pid}" 2>/dev/null; then
+        kill "${child_pid}" >/dev/null 2>&1 || true
+    fi
+}
+trap terminate_child INT TERM
+
 set +e
 "${TASKSET_PREFIX[@]}" "${BUILD_DIR}/bandle_replay" "${DAX_DEV}" "${NODE_ID}" "${PORT}" \
     --dataset "${DATASET_FILE}" \
@@ -83,9 +89,19 @@ set +e
     --noop-us "${NOOP_US}" \
     --batch-size "${BATCH_SIZE}" \
     --pipeline-workers "${PIPELINE_WORKERS}" \
+    --admission-window "${BANDLE_ADMISSION_WINDOW}" \
+    --admission-batch "${BANDLE_ADMISSION_BATCH}" \
     --perf-stats "${PERF_STATS}" \
-    --stats-out "${STATS_FILE}"
+    --stats-out "${STATS_FILE}" &
+child_pid=$!
+
+if [[ -n "${PID_FILE}" ]]; then
+    echo "${child_pid}" > "${PID_FILE}"
+fi
+
+wait "${child_pid}"
 status=$?
+trap - INT TERM
 set -e
 
 if [[ -n "${EXIT_FILE}" ]]; then

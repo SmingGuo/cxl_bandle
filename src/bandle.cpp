@@ -83,16 +83,17 @@ static inline size_t recv_batch_capacity(uint32_t submit_batch_size) {
     return std::min(kMaxRecvBatch, std::max(kMinRecvBatch, static_cast<size_t>(submit_batch_size)));
 }
 
-static inline uint64_t max_inflight_seq_window(uint32_t submit_batch_size, uint64_t cluster_size) {
-    constexpr uint64_t kTargetWindow = 160;
+static inline uint64_t max_inflight_seq_window(uint32_t submit_batch_size,
+                                               uint64_t cluster_size,
+                                               uint64_t configured_window) {
     const uint64_t min_for_batch =
         cluster_size * std::max<uint64_t>(static_cast<uint64_t>(submit_batch_size), 1) + cluster_size;
-    return std::max(kTargetWindow, min_for_batch);
+    return std::max(configured_window, min_for_batch);
 }
 
-static inline size_t admission_batch_capacity(size_t submit_count) {
-    constexpr size_t kAdmissionBatch = 32;
-    return std::max<size_t>(1, std::min(kAdmissionBatch, submit_count));
+static inline size_t admission_batch_capacity(size_t submit_count, uint32_t configured_batch) {
+    const size_t cap = std::max<size_t>(1, configured_batch);
+    return std::max<size_t>(1, std::min(cap, submit_count));
 }
 
 }
@@ -110,7 +111,9 @@ Bandle::Bandle(CXLMemoryPool* pool,
                int poll_idle_us,
                uint64_t noop_interval_us,
                uint32_t batch_size,
-               size_t pipeline_workers)
+               size_t pipeline_workers,
+               uint64_t admission_window,
+               uint32_t admission_batch)
     : pool_(pool),
       shared_(shared),
       non_hwcc_(reinterpret_cast<BandleNonHwccState*>(pool->get_non_hwcc())),
@@ -121,6 +124,8 @@ Bandle::Bandle(CXLMemoryPool* pool,
       noop_interval_us_(noop_interval_us),
       batch_size_(batch_size == 0 ? 1 : batch_size),
       pipeline_workers_(pipeline_workers == 0 ? 1 : pipeline_workers),
+      admission_window_(admission_window == 0 ? 1 : admission_window),
+      admission_batch_(admission_batch == 0 ? 1 : admission_batch),
       next_seq_(node_id) {
     if (cluster_size_ != 3 || node_id_ < 1 || node_id_ > cluster_size_) {
         std::cerr << "This initial Bandle-CXL implementation supports exactly 3 nodes" << std::endl;
@@ -250,14 +255,15 @@ void Bandle::submit_borrowed_batch(const BorrowedRequest* reqs, size_t count) {
         return;
     }
 
-    const size_t admit_cap = admission_batch_capacity(proposal_count);
+    const size_t admit_cap = admission_batch_capacity(proposal_count, admission_batch_);
     for (size_t base = 0; base < proposal_count; base += admit_cap) {
         const size_t chunk = std::min(admit_cap, proposal_count - base);
         BandleMessage* chunk_msgs = proposals + base;
 
         {
             uint32_t spins = 0;
-            const uint64_t window = max_inflight_seq_window(static_cast<uint32_t>(chunk), cluster_size_);
+            const uint64_t window =
+                max_inflight_seq_window(static_cast<uint32_t>(chunk), cluster_size_, admission_window_);
             while (true) {
                 bool assigned = false;
                 {

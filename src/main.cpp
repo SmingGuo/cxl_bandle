@@ -38,6 +38,28 @@ static inline uint64_t rdtsc_ordered() noexcept {
     return __rdtscp(&aux);
 }
 
+static uint64_t parse_run_token(const std::string& text) {
+    if (text.empty()) {
+        return 0;
+    }
+
+    size_t pos = 0;
+    try {
+        const uint64_t numeric = std::stoull(text, &pos, 10);
+        if (pos == text.size()) {
+            return numeric;
+        }
+    } catch (const std::exception&) {
+    }
+
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char c : text) {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ull;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
 static uint64_t calibrate_tsc_hz() noexcept {
     timespec req;
     req.tv_sec = 0;
@@ -142,7 +164,8 @@ static void usage(const char* prog) {
               << "[--preload-file <file>] [--preload-count <n>] [--recordcount <n>] "
               << "[--cluster-size <n>] [--run-id <id>] [--start-signal <file>] [--ready-file <file>] "
               << "[--poll-idle-us <n>] [--noop-us <n>] [--batch-size <n>] "
-              << "[--pipeline-workers <n>] [--stats-out <file>]\n";
+              << "[--pipeline-workers <n>] [--admission-window <n>] [--admission-batch <n>] "
+              << "[--stats-out <file>]\n";
 }
 
 int main(int argc, char** argv) {
@@ -168,6 +191,8 @@ int main(int argc, char** argv) {
     uint64_t noop_us = 100;
     uint32_t batch_size = 64;
     size_t pipeline_workers = 1;
+    uint64_t admission_window = 192;
+    uint32_t admission_batch = 32;
 
     for (int i = 4; i < argc; ++i) {
         std::string arg = argv[i];
@@ -182,7 +207,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--cluster-size" && i + 1 < argc) {
             cluster_size = std::stoull(argv[++i]);
         } else if (arg == "--run-id" && i + 1 < argc) {
-            run_id = std::stoull(argv[++i]);
+            run_id = parse_run_token(argv[++i]);
         } else if (arg == "--start-signal" && i + 1 < argc) {
             start_signal = argv[++i];
         } else if (arg == "--ready-file" && i + 1 < argc) {
@@ -195,6 +220,10 @@ int main(int argc, char** argv) {
             batch_size = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--pipeline-workers" && i + 1 < argc) {
             pipeline_workers = static_cast<size_t>(std::stoul(argv[++i]));
+        } else if (arg == "--admission-window" && i + 1 < argc) {
+            admission_window = std::stoull(argv[++i]);
+        } else if (arg == "--admission-batch" && i + 1 < argc) {
+            admission_batch = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--stats-out" && i + 1 < argc) {
             stats_out = argv[++i];
         }
@@ -223,10 +252,13 @@ int main(int argc, char** argv) {
     void* non_hwcc_ptr = static_cast<char*>(shared_memory) + CXLMemoryPool::HWCC_SIZE;
     auto* shared_state = reinterpret_cast<BandleSharedState*>(hwcc_ptr);
     auto* non_hwcc_state = reinterpret_cast<BandleNonHwccState*>(non_hwcc_ptr);
+    CXLMemoryPool pool(hwcc_ptr, non_hwcc_ptr);
 
     if (node_id == 1) {
         std::memset(shared_state, 0, sizeof(BandleSharedState));
         std::memset(non_hwcc_state, 0, sizeof(BandleNonHwccState));
+        pool.clflush(non_hwcc_state, sizeof(BandleNonHwccState));
+        pool.sfence();
         if (run_id != 0) {
             shared_state->run_id.store(run_id, std::memory_order_release);
         }
@@ -249,8 +281,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    CXLMemoryPool pool(hwcc_ptr, non_hwcc_ptr);
-    Bandle bandle(&pool, shared_state, node_id, cluster_size, poll_idle_us, noop_us, batch_size, pipeline_workers);
+    Bandle bandle(&pool,
+                  shared_state,
+                  node_id,
+                  cluster_size,
+                  poll_idle_us,
+                  noop_us,
+                  batch_size,
+                  pipeline_workers,
+                  admission_window,
+                  admission_batch);
     bandle.reserve_kv_entries(std::max<uint64_t>(recordcount, preload_count));
 
     if (preload_count > 0) {

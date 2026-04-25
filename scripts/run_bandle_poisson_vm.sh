@@ -44,6 +44,37 @@ PERF_STATS=${PERF_STATS:-0}
 DATASET_NAME_PREFIX=${DATASET_NAME_PREFIX:-""}
 KEEP_STATS=${KEEP_STATS:-0}
 
+# Admission defaults are tuned for the 3-node VM setup with 10M YCSB ops.
+# Override with BANDLE_ADMISSION_WINDOW/BANDLE_ADMISSION_BATCH when sweeping.
+case "${VALUE_BYTES}" in
+    64)
+        DEFAULT_BANDLE_ADMISSION_WINDOW=256
+        DEFAULT_BANDLE_ADMISSION_BATCH=32
+        ;;
+    128)
+        DEFAULT_BANDLE_ADMISSION_WINDOW=192
+        DEFAULT_BANDLE_ADMISSION_BATCH=32
+        ;;
+    256)
+        DEFAULT_BANDLE_ADMISSION_WINDOW=224
+        DEFAULT_BANDLE_ADMISSION_BATCH=32
+        ;;
+    512)
+        DEFAULT_BANDLE_ADMISSION_WINDOW=160
+        DEFAULT_BANDLE_ADMISSION_BATCH=16
+        ;;
+    1024)
+        DEFAULT_BANDLE_ADMISSION_WINDOW=128
+        DEFAULT_BANDLE_ADMISSION_BATCH=16
+        ;;
+    *)
+        DEFAULT_BANDLE_ADMISSION_WINDOW=192
+        DEFAULT_BANDLE_ADMISSION_BATCH=32
+        ;;
+esac
+BANDLE_ADMISSION_WINDOW=${BANDLE_ADMISSION_WINDOW:-${DEFAULT_BANDLE_ADMISSION_WINDOW}}
+BANDLE_ADMISSION_BATCH=${BANDLE_ADMISSION_BATCH:-${DEFAULT_BANDLE_ADMISSION_BATCH}}
+
 RUN_ID=${RUN_ID:-"$(date +%s)_$$"}
 SYNC_DIR_BASE=${SYNC_DIR_BASE:-"/tmp/cxl_bandle_sync_${RUN_ID}"}
 ARTIFACT_DIR_BASE=${ARTIFACT_DIR_BASE:-"${VM_BUILD_DIR}/vm_artifacts_${RUN_ID}"}
@@ -179,12 +210,14 @@ trap cleanup EXIT INT TERM
 echo "Cleaning residual processes on VMs..."
 for host in "${VM_HOSTS_ARR[@]}"; do
     ssh ${VM_SSH_OPTS} "${VM_USER}@${host}" \
-        "pkill -f bandle_replay >/dev/null 2>&1 || true; \
-         pkill -f run_bandle_poisson_vm_node.sh >/dev/null 2>&1 || true; \
+        "pkill -f '[b]andle_replay' >/dev/null 2>&1 || true; \
+         pkill -f '[r]un_bandle_poisson_vm_node.sh' >/dev/null 2>&1 || true; \
          rm -rf /tmp/cxl_bandle_sync_* '${ARTIFACT_DIR_BASE}'" || true
 done
 
 ensure_dataset
+
+echo "Runtime admission: window=${BANDLE_ADMISSION_WINDOW} batch=${BANDLE_ADMISSION_BATCH} value_bytes=${VALUE_BYTES}"
 
 echo "Syncing code to VMs..."
 for idx in "${!VM_HOSTS_ARR[@]}"; do
@@ -219,7 +252,7 @@ for idx in "${!VM_HOSTS_ARR[@]}"; do
     remote_env="NODE_ID=${node_id} NODES=${NODES} PORT=${port} DAX_DEV='${DAX_DEV}' \
 DATASET_FILE='${dataset_file}' PRELOAD_FILE='${leader_dataset}' PRELOAD_COUNT=${PRELOAD_COUNT} RECORDCOUNT=${RECORDCOUNT} \
 POLL_IDLE_US=${POLL_IDLE_US} NOOP_US=${NOOP_US} \
-BATCH_SIZE=${BATCH_SIZE} PIPELINE_WORKERS=${PIPELINE_WORKERS} PERF_STATS=${PERF_STATS} RUN_ID=${RUN_ID} \
+BATCH_SIZE=${BATCH_SIZE} PIPELINE_WORKERS=${PIPELINE_WORKERS} BANDLE_ADMISSION_WINDOW=${BANDLE_ADMISSION_WINDOW} BANDLE_ADMISSION_BATCH=${BANDLE_ADMISSION_BATCH} PERF_STATS=${PERF_STATS} RUN_ID=${RUN_ID} \
 CPU_PER_NODE=${CPU_PER_NODE} CPU_LIST='${CPU_LIST}' \
 START_SIGNAL='${start_signal}' READY_FILE='${ready_file}' STATS_FILE='${stats_file}' PID_FILE='${pid_file}' EXIT_FILE='${exit_file}'"
 

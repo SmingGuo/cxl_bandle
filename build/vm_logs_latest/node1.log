@@ -1,5 +1,0 @@
-node 1 submitted 1000000 ops
-node 1 submitted 2000000 ops
-node 1 submitted 3000000 ops
-node 1 local pending complete
-Replay finished. submitted=3333334 total_ops=3333334 reads=1666339 writes=1666995 ok=3333334 errors=0
