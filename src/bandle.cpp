@@ -132,11 +132,8 @@ Bandle::Bandle(CXLMemoryPool* pool,
         std::abort();
     }
     log_.resize(kCompletionSlots);
+    log_payloads_.resize(kCompletionSlots);
     pending_.resize(kCompletionSlots);
-    for (auto& entry : log_) {
-        entry.key.reserve(64);
-        entry.value.reserve(kMaxValueBytes);
-    }
 }
 
 Bandle::~Bandle() {
@@ -347,6 +344,21 @@ void Bandle::reserve_kv_entries(size_t total_keys) {
 
 uint16_t Bandle::shard_for(std::string_view key) {
     return static_cast<uint16_t>(TransparentStringHash{}(key) % KVStore::kNumShards);
+}
+
+void Bandle::reset_log_entry(LogEntry& e, uint64_t seq) {
+    e.proposal_known = false;
+    e.p1_sent = false;
+    e.decided = false;
+    e.decision = 0;
+    e.p1_value1_promise_mask = 0;
+    e.op = 'N';
+    e.key_len = 0;
+    e.value_len = 0;
+    e.proposer = 0;
+    e.client_req_id = 0;
+    e.start_tsc = 0;
+    e.seq = seq;
 }
 
 void Bandle::send_to_peer(uint64_t peer, const BandleMessage& msg) {
@@ -628,20 +640,10 @@ void Bandle::handle_message(const BandleMessage& msg) {
 void Bandle::handle_proposal_locked(const BandleMessage& msg, std::vector<BandleMessage>& outbox, bool advance) {
     (void)outbox;
     const auto& b = msg.body;
-    LogEntry& e = log_[b.seq & (kCompletionSlots - 1)];
+    const uint64_t slot = b.seq & (kCompletionSlots - 1);
+    LogEntry& e = log_[slot];
     if (e.seq != b.seq) {
-        e.proposal_known = false;
-        e.p1_sent = false;
-        e.decided = false;
-        e.decision = 0;
-        e.p1_value1_promise_mask = 0;
-        e.op = 'N';
-        e.key.clear();
-        e.value.clear();
-        e.proposer = 0;
-        e.client_req_id = 0;
-        e.start_tsc = 0;
-        e.seq = b.seq;
+        reset_log_entry(e, b.seq);
     }
     if (!e.proposal_known) {
         e.proposal_known = true;
@@ -650,14 +652,20 @@ void Bandle::handle_proposal_locked(const BandleMessage& msg, std::vector<Bandle
         e.client_req_id = b.client_req_id;
         e.start_tsc = b.start_tsc;
         if (b.op == 'G' || b.op == 'N') {
-            e.key.clear();
-            e.value.clear();
+            e.key_len = 0;
+            e.value_len = 0;
         } else {
-            e.key.assign(b.data, b.key_len);
-            if (b.value_len != 0) {
-                e.value.assign(b.data + b.key_len, b.value_len);
+            const uint64_t bytes = static_cast<uint64_t>(b.key_len) + static_cast<uint64_t>(b.value_len);
+            if (bytes <= kMaxValueBytes) {
+                e.key_len = b.key_len;
+                e.value_len = b.value_len;
+                if (bytes != 0) {
+                    std::memcpy(log_payloads_[slot].data(), b.data, static_cast<size_t>(bytes));
+                }
             } else {
-                e.value.clear();
+                e.op = 'N';
+                e.key_len = 0;
+                e.value_len = 0;
             }
         }
     }
@@ -676,18 +684,7 @@ void Bandle::handle_proposal_locked(const BandleMessage& msg, std::vector<Bandle
 void Bandle::input_one_locked(uint64_t seq, std::vector<BandleMessage>& outbox) {
     LogEntry& e = log_[seq & (kCompletionSlots - 1)];
     if (e.seq != seq) {
-        e.proposal_known = false;
-        e.p1_sent = false;
-        e.decided = false;
-        e.decision = 0;
-        e.p1_value1_promise_mask = 0;
-        e.op = 'N';
-        e.key.clear();
-        e.value.clear();
-        e.proposer = 0;
-        e.client_req_id = 0;
-        e.start_tsc = 0;
-        e.seq = seq;
+        reset_log_entry(e, seq);
     }
     if (e.p1_sent) {
         return;
@@ -717,18 +714,7 @@ void Bandle::handle_p1_locked(const BandleMessage& msg, std::vector<BandleMessag
     }
     LogEntry& e = log_[b.seq & (kCompletionSlots - 1)];
     if (e.seq != b.seq) {
-        e.proposal_known = false;
-        e.p1_sent = false;
-        e.decided = false;
-        e.decision = 0;
-        e.p1_value1_promise_mask = 0;
-        e.op = 'N';
-        e.key.clear();
-        e.value.clear();
-        e.proposer = 0;
-        e.client_req_id = 0;
-        e.start_tsc = 0;
-        e.seq = b.seq;
+        reset_log_entry(e, b.seq);
     }
     e.p1_value1_promise_mask |= static_cast<uint8_t>(1u << (b.sender - 1));
     if (__builtin_popcount(static_cast<unsigned>(e.p1_value1_promise_mask)) >= static_cast<int>(quorum_)) {
@@ -740,18 +726,7 @@ void Bandle::decide_locked(uint64_t seq, uint8_t value, std::vector<BandleMessag
     (void)outbox;
     LogEntry& e = log_[seq & (kCompletionSlots - 1)];
     if (e.seq != seq) {
-        e.proposal_known = false;
-        e.p1_sent = false;
-        e.decided = false;
-        e.decision = 0;
-        e.p1_value1_promise_mask = 0;
-        e.op = 'N';
-        e.key.clear();
-        e.value.clear();
-        e.proposer = 0;
-        e.client_req_id = 0;
-        e.start_tsc = 0;
-        e.seq = seq;
+        reset_log_entry(e, seq);
     }
     if (e.decided) {
         return;
@@ -765,18 +740,7 @@ void Bandle::handle_decide_locked(const BandleMessage& msg) {
     const auto& b = msg.body;
     LogEntry& e = log_[b.seq & (kCompletionSlots - 1)];
     if (e.seq != b.seq) {
-        e.proposal_known = false;
-        e.p1_sent = false;
-        e.decided = false;
-        e.decision = 0;
-        e.p1_value1_promise_mask = 0;
-        e.op = 'N';
-        e.key.clear();
-        e.value.clear();
-        e.proposer = 0;
-        e.client_req_id = 0;
-        e.start_tsc = 0;
-        e.seq = b.seq;
+        reset_log_entry(e, b.seq);
     }
     if (!e.decided) {
         e.decided = true;
@@ -805,11 +769,14 @@ void Bandle::advance_execute_locked() {
                 break;
             }
             if (e.decision == 1 && is_write_op(e.op)) {
+                const uint64_t slot = seq & (kCompletionSlots - 1);
+                const auto& payload = log_payloads_[slot];
                 KVStore::ApplyOp& op = apply_ops[apply_count++];
                 op.op = e.op;
-                op.shard = shard_for(e.key);
-                op.key = std::string_view(e.key);
-                op.value = (e.op == 'D') ? std::string_view() : std::string_view(e.value);
+                op.shard = shard_for(std::string_view(payload.data(), e.key_len));
+                op.key = std::string_view(payload.data(), e.key_len);
+                op.value = (e.op == 'D') ? std::string_view() :
+                                             std::string_view(payload.data() + e.key_len, e.value_len);
             }
         }
 
@@ -854,18 +821,7 @@ void Bandle::advance_execute_locked() {
                 }
             }
 
-            e.proposal_known = false;
-            e.p1_sent = false;
-            e.decided = false;
-            e.decision = 0;
-            e.p1_value1_promise_mask = 0;
-            e.op = 'N';
-            e.key.clear();
-            e.value.clear();
-            e.proposer = 0;
-            e.client_req_id = 0;
-            e.start_tsc = 0;
-            e.seq = 0;
+            reset_log_entry(e, 0);
         }
 
         execute_next_ += exec_count;

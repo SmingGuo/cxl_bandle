@@ -93,8 +93,8 @@ private:
         uint8_t decision = 0;
         uint8_t p1_value1_promise_mask = 0;
         char op = 'N';
-        std::string key;
-        std::string value;
+        uint32_t key_len = 0;
+        uint32_t value_len = 0;
         uint64_t proposer = 0;
         uint64_t client_req_id = 0;
         uint64_t start_tsc = 0;
@@ -137,6 +137,7 @@ private:
     void input_one_locked(uint64_t seq, std::vector<BandleMessage>& outbox);
     void decide_locked(uint64_t seq, uint8_t value, std::vector<BandleMessage>& outbox);
     void advance_execute_locked();
+    static void reset_log_entry(LogEntry& e, uint64_t seq);
     void broadcast(const BandleMessage& msg);
     void broadcast_batch(const BandleMessage* msgs, size_t count);
     void send_to_peer(uint64_t peer, const BandleMessage& msg);
@@ -167,6 +168,7 @@ private:
 
     mutable std::mutex mu_;
     std::vector<LogEntry> log_;
+    std::vector<std::array<char, kMaxValueBytes>> log_payloads_;
     uint64_t execute_next_ = 1;
     uint64_t next_seq_;
     uint64_t highest_proposed_seq_ = 0;

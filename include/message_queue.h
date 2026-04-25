@@ -301,14 +301,15 @@ private:
             pool_->nt_store_16(dst + off + 48, data + off + 48);
         }
 
-        const size_t tail = len - full;
-        if (tail != 0) {
-            alignas(64) char tmp[64] = {};
-            std::memcpy(tmp, data + full, tail);
-            pool_->nt_store_16(dst + full + 0, tmp + 0);
-            pool_->nt_store_16(dst + full + 16, tmp + 16);
-            pool_->nt_store_16(dst + full + 32, tmp + 32);
-            pool_->nt_store_16(dst + full + 48, tmp + 48);
+        size_t off = full;
+        while (off + 16 <= len) {
+            pool_->nt_store_16(dst + off, data + off);
+            off += 16;
+        }
+        if (off < len) {
+            alignas(16) char tmp[16] = {};
+            std::memcpy(tmp, data + off, len - off);
+            pool_->nt_store_16(dst + off, tmp);
         }
     }
 
